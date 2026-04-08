@@ -1,0 +1,6 @@
+*.bin
+*.pem
+extracted_audio/
+mdr_proxy/
+__pycache__/
+*.pyc
