@@ -1,93 +1,218 @@
-import struct
+import argparse
+import hashlib
 import lzma
 import os
+import struct
 import sys
-import hashlib
 from Crypto.Cipher import AES
 
-# --- Constants ---
-KEY = b"eibohjeCh6uegahf"
-IV  = b"miefeinuShu9eilo"
+# Known Sony Airoha FOTA AES-128-CBC keys
+MODEL_KEYS = {
+    "xb910n": (b"Quah8gangeizagie", b"ahcee8Yo1iekiu6e"),
+    "xm4":    (b"eibohjeCh6uegahf", b"miefeinuShu9eilo"),
+    "wfxm4":  (b"xoPh9reedaN6hai6", b"Ere8Quaixah0mee3"),
+}
+
 HEADER_SIZE = 0x1000
-TARGET_IMAGE_SIZE = 1048576 # 1MB
+TAG_BASIC_INFO = 0x0011
+TAG_MOVER_INFO = 0x0012
+TAG_INTEGRITY  = 0x0014
 
-def build_audio_image_fixed(input_dir: str) -> bytes:
-    files = sorted(f for f in os.listdir(input_dir) if f.endswith(".mp3"))
-    image = bytearray(struct.pack("<II", 1, len(files)))
-    table = bytearray()
-    audio = bytearray()
-    current_offset = 0x80000 + 8 + (len(files) * 8)
 
-    for filename in files:
-        with open(os.path.join(input_dir, filename), "rb") as f:
-            data = f.read()
-        table.extend(struct.pack("<II", len(data), current_offset))
-        audio.extend(data)
-        current_offset += len(data)
+def detect_key_and_decrypt(enc_body: bytes, forced_key: bytes = None, forced_iv: bytes = None):
+    candidates = [(forced_key, forced_iv)] if (forced_key and forced_iv) else list(MODEL_KEYS.values())
+    for key, iv in candidates:
+        dec = AES.new(key, AES.MODE_CBC, iv).decrypt(enc_body)
+        props = dec[0]
+        dict_size = struct.unpack_from("<I", dec, 1)[0]
+        if props <= 224 and dict_size in (4096, 8192, 16384, 32768, 65536):
+            lc = props % 9
+            rem = props // 9
+            lp = rem % 5
+            pb = rem // 5
+            try:
+                filters = [{"id": lzma.FILTER_LZMA1, "lc": lc, "lp": lp, "pb": pb, "dict_size": dict_size}]
+                img = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters).decompress(dec[13:])
+                return key, iv, {"props": props, "lc": lc, "lp": lp, "pb": pb, "dict_size": dict_size}, img
+            except lzma.LZMAError:
+                pass
+    raise RuntimeError("Could not decrypt/decompress source .bin with known keys")
 
-    full_image = image + table + audio
-    return full_image.ljust(TARGET_IMAGE_SIZE, b"\x00")
 
-def patch_header(header: bytearray, new_decomp: int, new_body: int, new_sha: bytes) -> bytearray:
-    # Body Size at 0x10A, Decomp at 0x13A, SHA at 0x14A
-    # Do NOT overwrite 0x106, that is the header size (4096)!
-    header[0x10A:0x10E] = struct.pack("<I", new_body)
-    header[0x13A:0x13E] = struct.pack("<I", new_decomp)
-    header[0x14A:0x14A+32] = new_sha
-    return header
+def walk_tlv(header: bytes, start: int = 0x100):
+    entries = {}
+    pos = start
+    while pos + 4 <= HEADER_SIZE:
+        tag, length = struct.unpack_from("<HH", header, pos)
+        if tag == 0 or tag == 0xFFFF or pos + 4 + length > HEADER_SIZE:
+            break
+        entries[tag] = (pos, length, bytes(header[pos + 4 : pos + 4 + length]))
+        pos += 4 + length
+    return entries
 
-def run_repack(orig_bin, input_dir, out_bin):
-    target_total_size = os.path.getsize(orig_bin)
-    
-    # 1. Rebuild source image
-    new_image = build_audio_image_fixed(input_dir)
+
+def patch_header(header: bytearray, body_size: int, decomp_size: int, sha256_digest: bytes):
+    tlvs = walk_tlv(header)
+    if TAG_BASIC_INFO not in tlvs or TAG_MOVER_INFO not in tlvs or TAG_INTEGRITY not in tlvs:
+        raise RuntimeError("Required TLV tags (0x11/0x12/0x14) missing in header")
+
+    pos, length, _ = tlvs[TAG_BASIC_INFO]
+    if length < 10:
+        raise RuntimeError(f"BASIC_INFO TLV too short: {length}")
+    struct.pack_into("<I", header, pos + 4 + 6, body_size)
+
+    pos, length, _ = tlvs[TAG_MOVER_INFO]
+    if length < 16:
+        raise RuntimeError(f"MOVER_INFO TLV too short: {length}")
+    struct.pack_into("<I", header, pos + 4 + 8, decomp_size)
+
+    pos, length, _ = tlvs[TAG_INTEGRITY]
+    if length < 36:
+        raise RuntimeError(f"INTEGRITY TLV too short: {length}")
+    header[pos + 4 + 4 : pos + 4 + 4 + 32] = sha256_digest
+
+
+class VoiceImage:
+    def __init__(self, blob: bytes):
+        self.raw_size = len(blob)
+        self.version, self.num_entries = struct.unpack_from("<II", blob, 0)
+        if self.num_entries == 0 or self.num_entries > 256:
+            raise ValueError(f"Unexpected num_entries={self.num_entries}")
+        table_end = 8 + self.num_entries * 8
+        first_abs = struct.unpack_from("<I", blob, 12)[0]
+        self.base_offset = first_abs - table_end
+
+        self.slots = []
+        last_end = table_end
+        for i in range(self.num_entries):
+            sz, abs_off = struct.unpack_from("<II", blob, 8 + i * 8)
+            rel = abs_off - self.base_offset
+            self.slots.append(blob[rel : rel + sz])
+            last_end = max(last_end, rel + sz)
+
+        # Preserve any trailing metadata (e.g. version string '1.0.3' at 0x130FC0 on XB910N)
+        self.orig_tail_offset = last_end
+        self.orig_tail = blob[last_end:]
+        nz = [idx for idx, b in enumerate(self.orig_tail) if b != 0]
+        self.first_tail_meta_abs = (last_end + nz[0]) if nz else self.raw_size
+
+    def serialize(self) -> bytes:
+        n = len(self.slots)
+        out = bytearray(struct.pack("<II", self.version, n))
+        out.extend(b"\x00" * (n * 8))
+        for i, data in enumerate(self.slots):
+            abs_off = self.base_offset + len(out)
+            struct.pack_into("<II", out, 8 + i * 8, len(data), abs_off)
+            out.extend(data)
+
+        if len(out) > self.first_tail_meta_abs:
+            raise ValueError(
+                f"Audio payload ({len(out)} B) overlaps trailing image metadata at 0x{self.first_tail_meta_abs:X}"
+            )
+
+        # Pad up to raw_size while preserving trailing metadata bytes at their exact offsets
+        tail_slice_start = len(out) - self.orig_tail_offset
+        if tail_slice_start >= 0:
+            out.extend(self.orig_tail[tail_slice_start:])
+        else:
+            out.extend(b"\x00" * (-tail_slice_start))
+            out.extend(self.orig_tail)
+
+        assert len(out) == self.raw_size
+        return bytes(out)
+
+
+def run_repack(orig_bin: str, out_bin: str, input_dir: str = None, slot_overrides: dict = None,
+               key_bytes: bytes = None, iv_bytes: bytes = None):
+    with open(orig_bin, "rb") as f:
+        orig_data = f.read()
+
+    header = bytearray(orig_data[:HEADER_SIZE])
+    key, iv, lzma_params, orig_img = detect_key_and_decrypt(orig_data[HEADER_SIZE:], key_bytes, iv_bytes)
+
+    img = VoiceImage(orig_img)
+    print(f"Loaded {orig_bin}: ver={img.version}, slots={img.num_entries}, "
+          f"base=0x{img.base_offset:08X}, image_size={img.raw_size}")
+
+    if input_dir:
+        files = sorted(f for f in os.listdir(input_dir) if f.endswith(".mp3"))
+        if len(files) != img.num_entries:
+            raise ValueError(f"Expected {img.num_entries} mp3 files in {input_dir}, got {len(files)}")
+        for i, fn in enumerate(files):
+            with open(os.path.join(input_dir, fn), "rb") as f:
+                img.slots[i] = f.read()
+
+    if slot_overrides:
+        for slot_idx, mp3_path in slot_overrides.items():
+            if not (0 <= slot_idx < img.num_entries):
+                raise ValueError(f"Slot {slot_idx} out of range (0..{img.num_entries - 1})")
+            with open(mp3_path, "rb") as f:
+                new_mp3 = f.read()
+            print(f"  Replacing slot {slot_idx:02d}: {len(img.slots[slot_idx])} B -> {len(new_mp3)} B ({mp3_path})")
+            img.slots[slot_idx] = new_mp3
+
+    new_image = img.serialize()
     new_sha = hashlib.sha256(new_image).digest()
-    
-    # 2. Compress with RAW LZMA
-    filters = [{"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": 16384}]
-    compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=filters)
-    compressed = compressor.compress(new_image) + compressor.flush()
-    
-    # Sony Header: [Props(1)][Dict(4)][UncompSize(8)]
-    lzma_header = struct.pack("<BIQ", 0x5D, 16384, len(new_image))
+
+    filters = [{
+        "id": lzma.FILTER_LZMA1,
+        "lc": lzma_params["lc"],
+        "lp": lzma_params["lp"],
+        "pb": lzma_params["pb"],
+        "dict_size": lzma_params["dict_size"],
+        "preset": 0,
+    }]
+    compressed = lzma.compress(new_image, format=lzma.FORMAT_RAW, filters=filters)
+    lzma_header = struct.pack("<BIQ", lzma_params["props"], lzma_params["dict_size"], len(new_image))
     payload = lzma_header + compressed
 
-    # 3. DYNAMIC BODY SIZE WITH AES ALIGNMENT
-    # To prevent failing at 99% upload, we must NOT pad the payload arbitrarily to match
-    # the original file size. If we feed thousands of bytes of 0xFF padding into the
-    # firmware's LZMA decompressor, it will reject the file as corrupt because it finishes
-    # decompressing the stream before consuming all the AES decrypted input bytes!
-    # Instead, we only pad up to the next 16-byte block boundary required by AES CBC.
-    current_len = len(payload)
-    aes_padding = 16 - (current_len % 16)
-    if aes_padding == 16: aes_padding = 0
-    final_payload = payload + (b"\xFF" * aes_padding)
+    aes_pad = (-len(payload)) % 16
+    if aes_pad:
+        payload += b"\xFF" * aes_pad
 
-    # 4. ENCRYPT THE EXACT VALID PAYLOAD
-    cipher = AES.new(KEY, AES.MODE_CBC, IV)
-    new_body = cipher.encrypt(final_payload)
-    
-    # We do NOT append any unencrypted garbage. The proxy will dynamically compute
-    # {FWlength} from the physical file size on disk!
-    full_bin_content = new_body
+    new_body = AES.new(key, AES.MODE_CBC, iv).encrypt(payload)
+    patch_header(header, len(new_body), len(new_image), new_sha)
 
-
-    # 5. Final Patch and Save
-    with open(orig_bin, "rb") as f:
-        orig_header = bytearray(f.read(HEADER_SIZE))
-
-    # NOTE: The body_size we write to the header MUST be the exact len(new_body), NOT the total padded file length,
-    # otherwise Sony's decompressor will try to unpack the 0xFF trailing flash padding and crash at 99%!
-    patched_header = patch_header(orig_header, len(new_image), len(new_body), new_sha)
+    full = bytes(header) + new_body
+    # Critical integrity hash verified on-device at CheckIntegrity (0x1C01)
+    file_checksum = hashlib.sha256(full[0x100:]).digest()
+    final_data = file_checksum + full[32:]
 
     with open(out_bin, "wb") as f:
-        f.write(patched_header)
-        f.write(full_bin_content)
+        f.write(final_data)
 
-    print(f"SUCCESS: {out_bin} created.")
-    print(f"Original Size: {target_total_size}")
-    print(f"New File Size: {os.path.getsize(out_bin)}")
-    print(f"SHA-256 Updated: {new_sha.hex()[:10]}...")
+    print(f"SUCCESS: {out_bin} ({len(final_data)} B, sha1={hashlib.sha1(final_data).hexdigest()})")
+    print(f"  Header SHA-256 (0x000): {file_checksum.hex()[:16]}...")
+    print(f"  Image  SHA-256 (0x14A): {new_sha.hex()[:16]}...")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Repack Sony Airoha voice prompt .bin (WH-XB910N / WH-1000XM4)")
+    p.add_argument("orig_bin", help="Original VP_*.bin template")
+    p.add_argument("input_dir_or_out", help="MP3 folder (legacy 3-arg mode) or output .bin path (with --slot)")
+    p.add_argument("out_bin", nargs="?", help="Output .bin path (legacy 3-arg mode)")
+    p.add_argument("--slot", action="append", default=[], metavar="N=PATH",
+                   help="Replace slot index N with MP3 file PATH (repeatable)")
+    p.add_argument("--key", help="Optional 16-byte ASCII AES key")
+    p.add_argument("--iv", help="Optional 16-byte ASCII AES IV")
+    args = p.parse_args()
+
+    overrides = {}
+    for spec in args.slot:
+        idx_s, path = spec.split("=", 1)
+        overrides[int(idx_s)] = path
+
+    if args.out_bin:
+        input_dir = args.input_dir_or_out
+        out_bin = args.out_bin
+    else:
+        input_dir = None
+        out_bin = args.input_dir_or_out
+
+    key_b = args.key.encode() if args.key else None
+    iv_b = args.iv.encode() if args.iv else None
+    run_repack(args.orig_bin, out_bin, input_dir=input_dir, slot_overrides=overrides, key_bytes=key_b, iv_bytes=iv_b)
+
 
 if __name__ == "__main__":
-    run_repack(sys.argv[1], sys.argv[2], sys.argv[3])
+    main()
