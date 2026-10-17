@@ -4,3 +4,4 @@ extracted_audio/
 mdr_proxy/
 __pycache__/
 *.pyc
+extracted_xb910n_en/
